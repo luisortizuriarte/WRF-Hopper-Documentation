@@ -144,6 +144,10 @@ While interactive sessions are useful for preprocessing, the main model integrat
 
 Ensure you are still in your `~/WRF/run` directory. Create a new file named `submit_wrf.slurm` and add the following configuration. This script requests 16 tasks and dynamically maximizes the memory request (4 GB per core) based on Hopper's standard compute node topology.
 
+Note: WRF and its NetCDF dependencies were originally compiled during an interactive session that landed on an Intel node. The resulting binaries and Spack-provided modules were optimized with Intel-specific CPU instructions. When the Slurm scheduler randomly assigned the run to an AMD node in the normal partition, the AMD processor encounters machine code it cannot execute, triggering an "illegal instruction" failure.
+
+To fix this, the Slurm batch script must explicitly request Intel nodes to match the compilation environment. Add the following hardware constraint directive to the #SBATCH header section of your submission script:
+
 ```bash
 #!/bin/bash
 #SBATCH --job-name=wrf_matthew
@@ -153,6 +157,7 @@ Ensure you are still in your `~/WRF/run` directory. Create a new file named `sub
 #SBATCH --time=0-06:00:00
 #SBATCH --output=wrf_run_%j.out
 #SBATCH --error=wrf_run_%j.err
+#SBATCH --constraint=intel
 
 # Clear the environment and load required modules
 module purge
