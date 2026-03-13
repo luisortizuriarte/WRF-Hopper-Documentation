@@ -1,146 +1,145 @@
-Here is a complete, clean Markdown guide that you can copy and paste directly into a `README.md` file for your GitHub repository. It is specifically tailored for George Mason University's Hopper cluster, incorporating all the exact module dependencies and configuration patches required to get the GNU toolchain working smoothly.
 
----
 
-# Compiling WRF and WPS on GMU's Hopper HPC
+# WRF Compilation and Execution Guide for Hopper (AMD Architecture)
 
-This guide details the steps required to compile the Weather Research and Forecasting (WRF) model and the WRF Preprocessing System (WPS) on George Mason University's Hopper High-Performance Computing cluster. It utilizes the default GNU compiler and OpenMPI toolchain.
+This guide outlines the process for compiling WRF v4.x using the GNU 12 compiler suite on Hopper. 
 
-## 0. Request an Interactive Session
+## Environment Preparation
 
-Compiling these models is resource-intensive and should never be done on the login nodes. Start by requesting an interactive compute node:
+To ensure the compiler links the correct AMD-specific instructions (e.g., `zen2`, `zen3`, or `x86_64_v3`), the compilation must be performed on an AMD node.
+
+**1. Access the AMD Hardware**
+Log into the dedicated AMD login node or request an interactive session on the AMD compute partition:
 
 ```bash
-salloc --partition=interactive --time=02:00:00 --nodes=1 --ntasks=4
+salloc --partition=interactive --constraint=amd --time=02:00:00 --nodes=1 --ntasks=4
 
 ```
 
-## Part 1: Compiling WRF (em_real)
-
-### 1. Load Required Modules
-
-Hopper uses a hierarchical module system (Lmod). You must load the compiler and MPI libraries before the NetCDF libraries become available. We also load `autotools` to provide the `m4` macro processor required by WRF.
+**2. Load the Software Stack**
 
 ```bash
 module purge
-module load gnu9
-module load openmpi4
-module load netcdf-c
-module load netcdf-fortran
-module load autotools
+module load gnu12 openmpi4 netcdf-c netcdf-fortran autotools m4
 
 ```
 
-### 2. Set Environment Variables
+## NetCDF Symlink Workaround
 
-WRF requires strict paths for NetCDF. We also enable large file support, which is critical for high-resolution simulations to bypass the 2GB file size limit.
+Modern Spack package managers strictly isolate C and Fortran libraries into separate installation directories. The WRF configuration script frequently fails to locate the Fortran headers (like `netcdf.inc`) when pointed to a split installation. To bypass this, create a unified directory structure in your project space.
+
+**1. Capture the Module Paths**
 
 ```bash
-export NETCDF=$(dirname $(dirname $(which nc-config)))
+NC_C=$(dirname $(dirname $(which nc-config)))
+NC_F=$(dirname $(dirname $(which nf-config)))
+
+```
+
+**2. Create a Unified Directory**
+Create a master directory to house the symlinks. *(Replace `$USER` with your NetID if running outside of your own environment).*
+
+```bash
+mkdir -p /projects/$USER/wrf_netcdf/include
+mkdir -p /projects/$USER/wrf_netcdf/lib
+
+```
+
+**3. Symlink the C and Fortran Libraries**
+
+```bash
+ln -sf $NC_C/include/* /projects/$USER/wrf_netcdf/include/
+ln -sf $NC_C/lib/* /projects/$USER/wrf_netcdf/lib/
+ln -sf $NC_C/lib64/* /projects/$USER/wrf_netcdf/lib/ 2>/dev/null
+
+ln -sf $NC_F/include/* /projects/$USER/wrf_netcdf/include/
+ln -sf $NC_F/lib/* /projects/$USER/wrf_netcdf/lib/
+ln -sf $NC_F/lib64/* /projects/$USER/wrf_netcdf/lib/ 2>/dev/null
+
+```
+
+## Configuration and Patching
+
+**1. Set Environment Variables**
+Direct WRF to the newly created unified directory and enable large file support.
+
+```bash
+export NETCDF=/projects/$USER/wrf_netcdf
+unset NETCDFF
 export WRFIO_NCD_LARGE_FILE_SUPPORT=1
 export NETCDF_classic=1
 
 ```
 
-### 3. Clone and Configure
-
-Clone the repository and run the configuration script:
+**2. Configure WRF**
+Navigate to the WRF source directory, clean any previous builds, and generate the configuration file.
 
 ```bash
-git clone https://github.com/wrf-model/WRF.git
-cd WRF
+cd ~/WRF
+./clean -a
 ./configure
 
 ```
 
-When prompted, select:
+* **Compiler Selection:** Enter `34` for GNU (gfortran/gcc) with distributed memory (`dmpar`).
+* **Nesting Selection:** Enter `1` for basic nesting.
 
-* **Compiler/MPI:** Option for **GNU (gfortran/gcc)** and **dmpar** (Distributed Memory Parallelism). *Usually Option 34.*
-* **Nesting:** **Option 1** (basic).
-
-### 4. Patch the Configuration (Crucial Hopper Fix)
-
-By default, WRF prepends the `time` command to the Fortran compiler. Because `/usr/bin/time` is not installed on Hopper's stripped-down interactive nodes, the build will immediately fail. Run this `sed` command to strip `time` out of the configuration file:
+**3. Patch the 'time' Wrapper Bug**
+Hopper's compute nodes often fail to resolve the `time` wrapper injected by the `gnu12` configuration script, which completely halts the compilation of Fortran files. Strip this command out of the generated file:
 
 ```bash
-sed -i 's/time mpif90/mpif90/g' configure.wrf
+sed -i 's/time $(DM_FC)/$(DM_FC)/g' configure.wrf
 
 ```
 
-### 5. Compile WRF
+## Compilation and Verification
 
-Compile the `em_real` case using the 4 cores allocated in your interactive session:
+**1. Build the Executables**
+Compile the real-data case using the cores allocated in your interactive session to accelerate the process.
 
 ```bash
 ./compile -j 4 em_real >& compile_em_real.log
 
 ```
 
-*Verification:* Check the `main/` directory for `wrf.exe` and `real.exe`, or ensure the last line of your log reads `Executables successfully built`.
+**2. Verify the Build**
+Confirm that `wrf.exe`, `real.exe`, `ndown.exe`, and `tc.exe` were successfully generated in the `main/` directory. Check the dynamic linking to guarantee the executable is pointing to the `x86_64_v3` architecture rather than `cascadelake`.
+
+```bash
+ldd main/wrf.exe | grep netcdf
+
+```
 
 ---
 
-## Part 2: Compiling WPS
+## Slurm Job Submission
 
-WPS must be compiled in the same environment and directory level as WRF, as it links directly to the compiled WRF libraries.
+To execute the newly compiled binary, the Slurm submission script must explicitly mandate the AMD partition. If submitted without the hardware constraint, the scheduler may route the job to an Intel node, resulting in immediate failure.
 
-### 1. Load Additional Modules
+To maximize parallel efficiency and avoid over-decomposition on high-resolution urban canopy grids, align the core request with the physical architecture of Hopper's AMD nodes (64 cores, 256 GB RAM per node).
 
-WPS requires image compression libraries to decode GRIB2 meteorological files. Load these on top of your existing WRF modules:
-
-```bash
-module load jasper
-module load libpng
-module load zlib
-
-```
-
-### 2. Set WPS Environment Variables
-
-WPS requires specific Jasper variables. We map Hopper's `$JASPER_DIR` to the variables the configure script expects:
+### Sample Submission Script (`submit_wrf.sh`)
 
 ```bash
-export JASPERLIB=${JASPER_DIR}/lib
-export JASPERINC=${JASPER_DIR}/include
+#!/bin/bash
+#SBATCH --job-name=wrf_run
+#SBATCH --partition=normal
+#SBATCH --constraint=amd         # CRITICAL: Forces execution on AMD nodes
+#SBATCH --nodes=1                # Scales appropriately for most 500m domains
+#SBATCH --ntasks=64              # Utilizes exactly one full AMD node
+#SBATCH --mem=0                  # Claims all 256GB of available node memory
+#SBATCH --time=24:00:00          # Adjust based on simulation length
+#SBATCH --output=wrf_run_%j.log
+#SBATCH --error=wrf_run_%j.err
+
+# 1. Load the exact environment used during compilation
+module purge
+module load gnu12 openmpi4 netcdf-c netcdf-fortran
+
+# 2. Navigate to the execution directory
+cd /projects/$USER/your_wrf_run_directory
+
+# 3. Execute WRF utilizing the InfiniBand network
+mpirun ./wrf.exe
 
 ```
-
-### 3. Clone and Configure
-
-Navigate back to your parent directory, clone WPS, and configure it:
-
-```bash
-cd ..
-git clone https://github.com/wrf-model/WPS.git
-cd WPS
-./configure
-
-```
-
-When prompted, select:
-
-* **Option 3:** `Linux x86_64, gfortran (dmpar)`
-
-### 4. Compile WPS
-
-Compile the preprocessing executables:
-
-```bash
-./compile >& compile_wps.log
-
-```
-
-*Verification:* Run `ls -l *.exe`. You should see `geogrid.exe`, `ungrib.exe`, and `metgrid.exe` successfully linked in the directory.
-
----
-
-### Note on Interactive Node Testing
-
-If you test run `wrf.exe` on a single Hopper interactive node via `mpirun`, you may encounter an immediate OpenMPI segmentation fault related to UCX and the `mlx5` InfiniBand driver. To bypass the network driver and force the node to use shared memory for local testing, run:
-
-```bash
-mpirun --mca pml ob1 --mca btl vader,self -np 4 ./wrf.exe
-
-```
-
-*(Note: These flags are only for single-node interactive testing. Standard Slurm batch submissions on Hopper's compute partitions do not require them).*
